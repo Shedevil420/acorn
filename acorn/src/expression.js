@@ -324,6 +324,10 @@ pp.parseSubscripts = function(base, startPos, startLoc, noCalls, forInit) {
   }
 }
 
+pp.shouldParseAsyncArrow = function() {
+  return !this.canInsertSemicolon() && this.eat(tt.arrow)
+}
+
 pp.parseSubscript = function(base, startPos, startLoc, noCalls, maybeAsyncArrow, optionalChained, forInit) {
   let optionalSupported = this.options.ecmaVersion >= 11
   let optional = optionalSupported && this.eat(tt.questionDot)
@@ -352,7 +356,7 @@ pp.parseSubscript = function(base, startPos, startLoc, noCalls, maybeAsyncArrow,
     this.awaitPos = 0
     this.awaitIdentPos = 0
     let exprList = this.parseExprList(tt.parenR, this.options.ecmaVersion >= 8, false, refDestructuringErrors)
-    if (maybeAsyncArrow && !optional && !this.canInsertSemicolon() && this.eat(tt.arrow)) {
+    if (maybeAsyncArrow && !optional && this.shouldParseAsyncArrow()) {
       this.checkPatternErrors(refDestructuringErrors, false)
       this.checkYieldAwaitInDefaultParams()
       if (this.awaitIdentPos > 0)
@@ -390,7 +394,7 @@ pp.parseSubscript = function(base, startPos, startLoc, noCalls, maybeAsyncArrow,
 // `new`, or an expression wrapped in punctuation like `()`, `[]`,
 // or `{}`.
 
-pp.parseExprAtom = function(refDestructuringErrors, forInit) {
+pp.parseExprAtom = function(refDestructuringErrors, forInit, forNew) {
   // If a division operator appears in an expression position, the
   // tokenizer got confused, and we force it to read a regexp instead.
   if (this.type === tt.slash) this.readRegexp()
@@ -491,17 +495,21 @@ pp.parseExprAtom = function(refDestructuringErrors, forInit) {
 
   case tt._import:
     if (this.options.ecmaVersion >= 11) {
-      return this.parseExprImport()
+      return this.parseExprImport(forNew)
     } else {
       return this.unexpected()
     }
 
   default:
-    this.unexpected()
+    return this.parseExprAtomDefault()
   }
 }
 
-pp.parseExprImport = function() {
+pp.parseExprAtomDefault = function() {
+  this.unexpected()
+}
+
+pp.parseExprImport = function(forNew) {
   const node = this.startNode()
 
   // Consume `import` as an identifier for `import.meta`.
@@ -509,13 +517,12 @@ pp.parseExprImport = function() {
   if (this.containsEsc) this.raiseRecoverable(this.start, "Escape sequence in keyword import")
   const meta = this.parseIdent(true)
 
-  switch (this.type) {
-  case tt.parenL:
+  if (this.type === tt.parenL && !forNew) {
     return this.parseDynamicImport(node)
-  case tt.dot:
+  } else if (this.type === tt.dot) {
     node.meta = meta
     return this.parseImportMeta(node)
-  default:
+  } else {
     this.unexpected()
   }
 }
@@ -571,6 +578,10 @@ pp.parseParenExpression = function() {
   return val
 }
 
+pp.shouldParseArrow = function() {
+  return !this.canInsertSemicolon()
+}
+
 pp.parseParenAndDistinguishExpression = function(canBeArrow, forInit) {
   let startPos = this.start, startLoc = this.startLoc, val, allowTrailingComma = this.options.ecmaVersion >= 8
   if (this.options.ecmaVersion >= 6) {
@@ -590,7 +601,12 @@ pp.parseParenAndDistinguishExpression = function(canBeArrow, forInit) {
       } else if (this.type === tt.ellipsis) {
         spreadStart = this.start
         exprList.push(this.parseParenItem(this.parseRestBinding()))
-        if (this.type === tt.comma) this.raise(this.start, "Comma is not permitted after the rest element")
+        if (this.type === tt.comma) {
+          this.raise(
+            this.start,
+            "Comma is not permitted after the rest element"
+          )
+        }
         break
       } else {
         exprList.push(this.parseMaybeAssign(false, refDestructuringErrors, this.parseParenItem))
@@ -599,7 +615,7 @@ pp.parseParenAndDistinguishExpression = function(canBeArrow, forInit) {
     let innerEndPos = this.lastTokEnd, innerEndLoc = this.lastTokEndLoc
     this.expect(tt.parenR)
 
-    if (canBeArrow && !this.canInsertSemicolon() && this.eat(tt.arrow)) {
+    if (canBeArrow && this.shouldParseArrow() && this.eat(tt.arrow)) {
       this.checkPatternErrors(refDestructuringErrors, false)
       this.checkYieldAwaitInDefaultParams()
       this.yieldPos = oldYieldPos
@@ -665,11 +681,8 @@ pp.parseNew = function() {
       this.raiseRecoverable(node.start, "'new.target' can only be used in functions and class static block")
     return this.finishNode(node, "MetaProperty")
   }
-  let startPos = this.start, startLoc = this.startLoc, isImport = this.type === tt._import
-  node.callee = this.parseSubscripts(this.parseExprAtom(), startPos, startLoc, true, false)
-  if (isImport && node.callee.type === "ImportExpression") {
-    this.raise(startPos, "Cannot use new with import()")
-  }
+  let startPos = this.start, startLoc = this.startLoc
+  node.callee = this.parseSubscripts(this.parseExprAtom(null, false, true), startPos, startLoc, true, false)
   if (this.eat(tt.parenL)) node.arguments = this.parseExprList(tt.parenR, this.options.ecmaVersion >= 8, false)
   else node.arguments = empty
   return this.finishNode(node, "NewExpression")
@@ -750,15 +763,6 @@ pp.parseProperty = function(isPattern, refDestructuringErrors) {
       }
       return this.finishNode(prop, "RestElement")
     }
-    // To disallow parenthesized identifier via `this.toAssignable()`.
-    if (this.type === tt.parenL && refDestructuringErrors) {
-      if (refDestructuringErrors.parenthesizedAssign < 0) {
-        refDestructuringErrors.parenthesizedAssign = this.start
-      }
-      if (refDestructuringErrors.parenthesizedBind < 0) {
-        refDestructuringErrors.parenthesizedBind = this.start
-      }
-    }
     // Parse argument.
     prop.argument = this.parseMaybeAssign(false, refDestructuringErrors)
     // To disallow trailing comma via `this.toAssignable()`.
@@ -783,12 +787,29 @@ pp.parseProperty = function(isPattern, refDestructuringErrors) {
   if (!isPattern && !containsEsc && this.options.ecmaVersion >= 8 && !isGenerator && this.isAsyncProp(prop)) {
     isAsync = true
     isGenerator = this.options.ecmaVersion >= 9 && this.eat(tt.star)
-    this.parsePropertyName(prop, refDestructuringErrors)
+    this.parsePropertyName(prop)
   } else {
     isAsync = false
   }
   this.parsePropertyValue(prop, isPattern, isGenerator, isAsync, startPos, startLoc, refDestructuringErrors, containsEsc)
   return this.finishNode(prop, "Property")
+}
+
+pp.parseGetterSetter = function(prop) {
+  prop.kind = prop.key.name
+  this.parsePropertyName(prop)
+  prop.value = this.parseMethod(false)
+  let paramCount = prop.kind === "get" ? 0 : 1
+  if (prop.value.params.length !== paramCount) {
+    let start = prop.value.start
+    if (prop.kind === "get")
+      this.raiseRecoverable(start, "getter should have no params")
+    else
+      this.raiseRecoverable(start, "setter should have exactly one param")
+  } else {
+    if (prop.kind === "set" && prop.value.params[0].type === "RestElement")
+      this.raiseRecoverable(prop.value.params[0].start, "Setter cannot use rest params")
+  }
 }
 
 pp.parsePropertyValue = function(prop, isPattern, isGenerator, isAsync, startPos, startLoc, refDestructuringErrors, containsEsc) {
@@ -808,20 +829,7 @@ pp.parsePropertyValue = function(prop, isPattern, isGenerator, isAsync, startPos
              (prop.key.name === "get" || prop.key.name === "set") &&
              (this.type !== tt.comma && this.type !== tt.braceR && this.type !== tt.eq)) {
     if (isGenerator || isAsync) this.unexpected()
-    prop.kind = prop.key.name
-    this.parsePropertyName(prop)
-    prop.value = this.parseMethod(false)
-    let paramCount = prop.kind === "get" ? 0 : 1
-    if (prop.value.params.length !== paramCount) {
-      let start = prop.value.start
-      if (prop.kind === "get")
-        this.raiseRecoverable(start, "getter should have no params")
-      else
-        this.raiseRecoverable(start, "setter should have exactly one param")
-    } else {
-      if (prop.kind === "set" && prop.value.params[0].type === "RestElement")
-        this.raiseRecoverable(prop.value.params[0].start, "Setter cannot use rest params")
-    }
+    this.parseGetterSetter(prop)
   } else if (this.options.ecmaVersion >= 6 && !prop.computed && prop.key.type === "Identifier") {
     if (isGenerator || isAsync) this.unexpected()
     this.checkUnreserved(prop.key)
@@ -1020,7 +1028,19 @@ pp.checkUnreserved = function({start, end, name}) {
 // when parsing properties), it will also convert keywords into
 // identifiers.
 
-pp.parseIdent = function(liberal, isBinding) {
+pp.parseIdent = function(liberal) {
+  let node = this.parseIdentNode()
+  this.next(!!liberal)
+  this.finishNode(node, "Identifier")
+  if (!liberal) {
+    this.checkUnreserved(node)
+    if (node.name === "await" && !this.awaitIdentPos)
+      this.awaitIdentPos = node.start
+  }
+  return node
+}
+
+pp.parseIdentNode = function() {
   let node = this.startNode()
   if (this.type === tt.name) {
     node.name = this.value
@@ -1032,18 +1052,11 @@ pp.parseIdent = function(liberal, isBinding) {
     // But there is no chance to pop the context if the keyword is consumed as an identifier such as a property name.
     // If the previous token is a dot, this does not apply because the context-managing code already ignored the keyword
     if ((node.name === "class" || node.name === "function") &&
-        (this.lastTokEnd !== this.lastTokStart + 1 || this.input.charCodeAt(this.lastTokStart) !== 46)) {
+      (this.lastTokEnd !== this.lastTokStart + 1 || this.input.charCodeAt(this.lastTokStart) !== 46)) {
       this.context.pop()
     }
   } else {
     this.unexpected()
-  }
-  this.next(!!liberal)
-  this.finishNode(node, "Identifier")
-  if (!liberal) {
-    this.checkUnreserved(node)
-    if (node.name === "await" && !this.awaitIdentPos)
-      this.awaitIdentPos = node.start
   }
   return node
 }
